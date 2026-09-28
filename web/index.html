@@ -1,13 +1,175 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学术会议同行评审</title>
-<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
-<body><h1>学术会议同行评审</h1><p>选择身份后，页面会通过 <code>X-User-Id</code> 调用 JSON API。演示账号：alice、bob、r1、r2、r3、chair。</p>
-<div class="grid"><section class="panel"><h2>提交论文</h2><select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select><input id="title" placeholder="标题"><textarea id="abstract" placeholder="摘要（至少20字）"></textarea><button onclick="submitPaper()">提交</button></section>
-<section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section></div>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>学术会议同行评审</title>
+<style>
+body{font:16px system-ui;max-width:960px;margin:32px auto;padding:0 16px;color:#222}
+input,textarea,select,button{font:inherit;padding:8px;margin:4px}
+textarea{width:100%;height:80px;box-sizing:border-box}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px}
+.panel h2{margin-top:0}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:12px;border-radius:6px;min-height:40px}
+.scores label{display:inline-block;margin-right:12px}
+.total{font-weight:bold;color:#0a5}
+.locked{color:#a00}
+button{cursor:pointer}
+</style>
+</head>
+<body>
+<h1>学术会议同行评审</h1>
+<p>当前身份：
+<select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select>
+页面通过 <code>X-User-Id</code> 调用 JSON API。演示账号：alice、bob（作者），r1、r2、r3（评审人），chair（主席）。</p>
+
+<div class="grid">
+<section class="panel">
+<h2>论文</h2>
+<button onclick="loadPapers()">刷新可见论文</button>
+<pre id="papers"></pre>
+<h3>提交论文（作者）</h3>
+<input id="title" placeholder="标题" style="width:95%"><br>
+<textarea id="abstract" placeholder="摘要（至少 20 字）"></textarea>
+<button onclick="submitPaper()">提交论文</button>
+</section>
+
+<section class="panel">
+<h2>主席：分配与决定</h2>
+论文 ID <input id="cpaper" size="6"> 评审人 <input id="creviewer" value="r1" size="6">
+<button onclick="assign()">邀请评审</button>
+<button onclick="addConflict()">登记冲突</button><br>
+决定：
+<select id="decision"><option value="accept">accept</option><option value="reject">reject</option><option value="minor_revision" selected>minor_revision</option><option value="major_revision">major_revision</option></select>
+<input id="dnote" placeholder="决定备注">
+<button onclick="decide()">作决定（至少两份评审）</button>
+<h3>查看论文评审（维度分 + 总分）</h3>
+<button onclick="loadReviews()">查看该论文评审</button>
+<pre id="reviews"></pre>
+</section>
+
+<section class="panel">
+<h2>评审人：意向与邀请</h2>
+论文 ID <input id="rpaper" size="6">
+<select id="interest"><option value="want">want</option><option value="maybe">maybe</option><option value="decline">decline</option></select>
+<button onclick="bid()">提交意向</button><br>
+分配 ID <input id="assignId" size="6">
+<button onclick="respond(true)">接受邀请</button>
+<button onclick="respond(false)">拒绝</button>
+<button onclick="loadMyReview()">载入我的评审/草稿</button>
+
+<h3>三方面打分（各 1-5 分，缺一项不能提交）</h3>
+<div class="scores">
+<label>创新性（40%）<select id="s_innovation" onchange="refreshTotal()"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+<label>严谨性（35%）<select id="s_rigor" onchange="refreshTotal()"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+<label>复现性（25%）<select id="s_reproducibility" onchange="refreshTotal()"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+</div>
+<p>合成总分：<span class="total" id="total">—（三维度填齐后预览）</span></p>
+<textarea id="reviewText" placeholder="评审意见（至少 10 字）"></textarea>
+<button onclick="saveDraft()">保存草稿（仅自己可见，可续写）</button>
+<button id="submitBtn" onclick="submitReview()" disabled>提交评审（提交后锁定）</button>
+<p id="draftState"></p>
+</section>
+
+<section class="panel">
+<h2>作者：Rebuttal 与结果</h2>
+论文 ID <input id="apaper" size="6"><br>
+<textarea id="rebuttal" placeholder="Rebuttal 内容（至少 10 字）"></textarea>
+<button onclick="submitRebuttal()">提交 Rebuttal（仅一次）</button>
+<h3>决定后查看三项平均分</h3>
+<button onclick="loadAuthorReviews()">查看该论文评审平均分</button>
+<pre id="authorReviews"></pre>
+</section>
+</div>
+
 <script>
 const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
 document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
-async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
-async function submitPaper(){const p=await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})});alert(JSON.stringify(p,null,2))}
-async function loadPapers(){papers.textContent=JSON.stringify(await api("/api/papers"),null,2)}
-</script></body></html>
+const DIMS=["innovation","rigor","reproducibility"];
+const WEIGHTS={innovation:0.4,rigor:0.35,reproducibility:0.25};
+
+async function api(url,opt={}){
+  const r=await fetch(url,{...opt,headers});
+  return await r.json();
+}
+function show(el,payload){document.querySelector(el).textContent=JSON.stringify(payload,null,2)}
+
+async function submitPaper(){
+  show("#papers",await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})}));
+}
+async function loadPapers(){show("#papers",await api("/api/papers"))}
+
+async function assign(){
+  show("#reviews",await api(`/api/papers/${cpaper.value}/assignments`,{method:"POST",body:JSON.stringify({reviewer_id:creviewer.value})}));
+}
+async function addConflict(){
+  const reason=prompt("冲突原因：");
+  if(reason===null)return;
+  show("#reviews",await api(`/api/papers/${cpaper.value}/conflicts`,{method:"POST",body:JSON.stringify({reviewer_id:creviewer.value,reason})}));
+}
+async function decide(){
+  show("#reviews",await api(`/api/papers/${cpaper.value}/decision`,{method:"POST",body:JSON.stringify({decision:decision.value,note:dnote.value})}));
+}
+async function loadReviews(){show("#reviews",await api(`/api/papers/${cpaper.value}/reviews`))}
+
+async function bid(){
+  show("#draftState",await api(`/api/papers/${rpaper.value}/bids`,{method:"POST",body:JSON.stringify({interest:interest.value})}));
+}
+async function respond(accepted){
+  show("#draftState",await api(`/api/assignments/${assignId.value}/respond`,{method:"POST",body:JSON.stringify({accepted})}));
+}
+
+function readScores(){
+  const scores={};
+  for(const d of DIMS){const v=document.querySelector("#s_"+d).value;if(v!=="")scores[d]=Number(v)}
+  return scores;
+}
+function setScores(scores){
+  for(const d of DIMS)document.querySelector("#s_"+d).value=scores&&scores[d]?String(scores[d]):"";
+  refreshTotal();
+}
+function refreshTotal(){
+  const s=readScores();
+  const ready=DIMS.every(d=>d in s);
+  document.querySelector("#submitBtn").disabled=!ready;
+  document.querySelector("#total").textContent=ready
+    ?(s.innovation*WEIGHTS.innovation+s.rigor*WEIGHTS.rigor+s.reproducibility*WEIGHTS.reproducibility).toFixed(2)
+    :"—（三维度填齐后预览）";
+}
+async function loadMyReview(){
+  const data=await api(`/api/assignments/${assignId.value}/review`);
+  if(data.submitted){
+    document.querySelector("#draftState").innerHTML='<span class="locked">评审已提交并锁定，不能再修改。</span>';
+    const r=data.review;
+    setScores(r.scores);
+    reviewText.value=r.review_text||"";
+    for(const d of DIMS)document.querySelector("#s_"+d).disabled=true;
+    reviewText.disabled=true;
+    document.querySelector("#submitBtn").disabled=true;
+  }else{
+    for(const d of DIMS)document.querySelector("#s_"+d).disabled=false;
+    reviewText.disabled=false;
+    setScores(data.draft_scores);
+    reviewText.value=data.draft_text||"";
+    document.querySelector("#draftState").textContent=data.draft_updated_at?`草稿续写自 ${data.draft_updated_at}`:"尚未保存草稿";
+  }
+}
+async function saveDraft(){
+  const body=JSON.stringify({scores:readScores(),text:reviewText.value});
+  show("#draftState",await api(`/api/assignments/${assignId.value}/review-draft`,{method:"PUT",body}));
+}
+async function submitReview(){
+  const body=JSON.stringify({scores:readScores(),text:reviewText.value});
+  const res=await api(`/api/assignments/${assignId.value}/review`,{method:"POST",body});
+  if(res.error){document.querySelector("#draftState").textContent=res.error.message;return}
+  await loadMyReview();
+}
+
+async function submitRebuttal(){
+  show("#authorReviews",await api(`/api/papers/${apaper.value}/rebuttal`,{method:"POST",body:JSON.stringify({content:rebuttal.value})}));
+}
+async function loadAuthorReviews(){show("#authorReviews",await api(`/api/papers/${apaper.value}/reviews`))}
+</script>
+</body>
+</html>
