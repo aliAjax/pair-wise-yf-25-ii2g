@@ -12,6 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import scoring
+from scoring import DIMENSION_KEYS, LABELS, ScoreError, composite_score, dimension_averages, validate_scores
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
@@ -91,8 +94,11 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
                     status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
+                        CHECK (status IN ('invited','accepted','declined','draft','completed')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
+                    innovation INTEGER CHECK (innovation IS NULL OR innovation BETWEEN 1 AND 5),
+                    rigor INTEGER CHECK (rigor IS NULL OR rigor BETWEEN 1 AND 5),
+                    reproducibility INTEGER CHECK (reproducibility IS NULL OR reproducibility BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -124,6 +130,17 @@ class ReviewStore:
                 );
                 """
             )
+            # 旧库迁移：补齐三维度列；旧评审的维度分保持 NULL，总分仍读 score 列。
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(assignments)").fetchall()
+            }
+            for key in DIMENSION_KEYS:
+                if key not in existing:
+                    conn.execute(
+                        f"ALTER TABLE assignments ADD COLUMN {key} INTEGER "
+                        f"CHECK ({key} IS NULL OR {key} BETWEEN 1 AND 5)"
+                    )
 
     def seed(self) -> None:
         self.init_schema()
@@ -314,25 +331,146 @@ class ReviewStore:
             self._audit(conn, row["paper_id"], reviewer_id, "assignment.respond", {"assignment_id": assignment_id, "status": status})
             return {"id": assignment_id, "status": status}
 
-    def submit_review(self, reviewer_id: str, assignment_id: int, score: int, text: str) -> dict:
-        if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
-            raise BusinessError("评分必须是 1 到 5 的整数", 422, "invalid_score")
-        if len(text.strip()) < 10:
-            raise BusinessError("评审意见至少 10 字", 422, "review_too_short")
+    @staticmethod
+    def _scores_of(row: sqlite3.Row) -> dict[str, int | None]:
+        return {key: row[key] for key in DIMENSION_KEYS}
+
+    @staticmethod
+    def _is_legacy(row: sqlite3.Row) -> bool:
+        """旧评审：只有单一总分，没有维度分。"""
+        return row["score"] is not None and all(row[key] is None for key in DIMENSION_KEYS)
+
+    def _review_view(self, row: sqlite3.Row, viewer: sqlite3.Row) -> dict:
+        """按角色输出评审视图。
+
+        - 本人：草稿与已提交内容都可见。
+        - 主席：只看到已提交（completed）评审，含维度分与合成总分。
+        - 作者：决定后只看到各维度平均分，看不到任何单份评审文本与身份。
+        """
+        scores = self._scores_of(row)
+        legacy = self._is_legacy(row)
+        data: dict = {
+            "assignment_id": row["id"],
+            "paper_id": row["paper_id"],
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+        }
+        if viewer["role"] == "chair":
+            data["reviewer_id"] = row["reviewer_id"]
+            data["review_text"] = row["review_text"]
+            data["scores"] = scores
+            data["legacy"] = legacy
+            data["total"] = row["score"] if legacy else composite_score(scores)
+            data["weights"] = scoring.WEIGHTS
+        elif viewer["id"] == row["reviewer_id"]:
+            data["scores"] = scores
+            data["labels"] = LABELS
+            data["weights"] = scoring.WEIGHTS
+            data["review_text"] = row["review_text"]
+            data["locked"] = row["status"] == "completed"
+            if row["status"] == "completed":
+                data["legacy"] = legacy
+                data["total"] = row["score"] if legacy else composite_score(scores)
+        else:
+            # 决定后作者只看聚合平均分，由 list_reviews 单独组装，此处不输出明细。
+            raise BusinessError("无权查看该评审明细", 403, "forbidden")
+        return data
+
+    def _own_assignment(self, conn: sqlite3.Connection, reviewer_id: str, assignment_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
+        if not row or row["reviewer_id"] != reviewer_id:
+            raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
+        return row
+
+    def save_review_draft(self, reviewer_id: str, assignment_id: int, scores: object, text: str | None = None) -> dict:
+        """暂存评审草稿，可多次续写；只有本人可见，不锁定内容。"""
+        clean = validate_scores(scores, partial=True)
         with self.connect() as conn:
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "accepted":
+            row = self._own_assignment(conn, reviewer_id, assignment_id)
+            if row["status"] == "completed":
+                raise BusinessError("评审已提交并锁定，不能再修改", 409, "review_locked")
+            if row["status"] not in {"accepted", "draft"}:
+                raise BusinessError("只有已接受邀请的评审人可以暂存评审", 409, "invalid_assignment_state")
+            fields = {key: clean.get(key) for key in DIMENSION_KEYS}
+            updates = [f"{key}=COALESCE(?,{key})" for key in DIMENSION_KEYS]
+            params: list = [fields[key] for key in DIMENSION_KEYS]
+            if text is not None:
+                stripped = text.strip()
+                updates.append("review_text=?")
+                params.append(stripped)
+            updates.append("status='draft'")
+            updates.append("updated_at=?")
+            params.append(utcnow())
+            params.append(assignment_id)
+            conn.execute(f"UPDATE assignments SET {','.join(updates)} WHERE id=?", params)
+            self._audit(conn, row["paper_id"], reviewer_id, "review.draft_save", {"assignment_id": assignment_id})
+            saved = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
+            return {
+                "id": assignment_id,
+                "status": "draft",
+                "scores": self._scores_of(saved),
+                "ready_to_submit": all(saved[key] is not None for key in DIMENSION_KEYS),
+            }
+
+    def submit_review(self, reviewer_id: str, assignment_id: int, scores: object, text: str) -> dict:
+        clean = validate_scores(scores)  # 缺任何一个维度都会被拒绝。
+        if len(text.strip()) < 10:
+            raise BusinessError("评审意见至少 10 字", 422, "review_too_short")
+        total = composite_score(clean)
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            row = self._own_assignment(conn, reviewer_id, assignment_id)
+            if row["status"] == "completed":
+                raise BusinessError("评审已提交并锁定，不能再修改", 409, "review_locked")
+            if row["status"] not in {"accepted", "draft"}:
                 raise BusinessError("只有已接受邀请的评审人可以提交评审", 409, "invalid_assignment_state")
             conn.execute(
-                "UPDATE assignments SET status='completed',score=?,review_text=?,updated_at=? WHERE id=?",
-                (score, text.strip(), utcnow(), assignment_id),
+                f"""UPDATE assignments SET status='completed',{','.join(f'{key}=?' for key in DIMENSION_KEYS)},
+                   review_text=?,updated_at=? WHERE id=?""",
+                [clean[key] for key in DIMENSION_KEYS] + [text.strip(), utcnow(), assignment_id],
             )
-            self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id, "score": score})
-            return {"id": assignment_id, "status": "completed", "score": score}
+            self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id})
+            return {"id": assignment_id, "status": "completed", "scores": clean, "total": total, "weights": scoring.WEIGHTS}
+
+    def get_my_review(self, reviewer_id: str, assignment_id: int) -> dict:
+        """评审人取回自己的草稿或已提交评审（用于续写/核对）。"""
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            row = self._own_assignment(conn, reviewer_id, assignment_id)
+            return self._review_view(row, reviewer)
+
+    def list_reviews(self, user_id: str, paper_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                raise BusinessError("论文不存在", 404, "not_found")
+            if user["role"] == "chair":
+                rows = conn.execute(
+                    "SELECT * FROM assignments WHERE paper_id=? AND status='completed' ORDER BY id",
+                    (paper_id,),
+                ).fetchall()
+                return {"items": [self._review_view(row, user) for row in rows]}
+            if user["role"] == "author":
+                if paper["author_id"] != user_id:
+                    raise BusinessError("作者只能查看自己论文的评审结果", 403, "forbidden")
+                if paper["status"] != "decided":
+                    raise BusinessError("主席作出决定后才能查看评审结果", 409, "reviews_not_visible")
+                rows = conn.execute(
+                    "SELECT * FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)
+                ).fetchall()
+                averages = dimension_averages([dict(row) for row in rows])
+                return {
+                    "paper_id": paper_id,
+                    "count": len(rows),
+                    "averages": averages,
+                    "labels": LABELS,
+                }
+            raise BusinessError("评审人不能查看他人的评审明细", 403, "forbidden")
 
     def submit_rebuttal(self, author_id: str, paper_id: int, content: str) -> dict:
         if len(content.strip()) < 10:
@@ -455,15 +593,33 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "reviews" and method == "GET":
+                return self._send(200, store.list_reviews(self._user_id(), paper_id))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
-        if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
+        if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method in {"GET", "POST"}:
             assignment_id = int(parts[2])
-            data = self._body()
-            if parts[3] == "respond":
+            if parts[3] == "respond" and method == "POST":
+                data = self._body()
                 return self._send(200, store.respond_assignment(self._user_id(), assignment_id, bool(data.get("accepted"))))
-            if parts[3] == "review":
-                return self._send(201, store.submit_review(self._user_id(), assignment_id, data.get("score"), data.get("text", "")))
+            if parts[3] == "review" and method == "GET":
+                return self._send(200, store.get_my_review(self._user_id(), assignment_id))
+            if parts[3] == "review" and method == "POST":
+                data = self._body()
+                return self._send(
+                    201,
+                    store.submit_review(
+                        self._user_id(), assignment_id, data.get("scores"), data.get("text", "")
+                    ),
+                )
+            if parts[3] == "review-draft" and method == "POST":
+                data = self._body()
+                return self._send(
+                    201,
+                    store.save_review_draft(
+                        self._user_id(), assignment_id, data.get("scores"), data.get("text")
+                    ),
+                )
         raise BusinessError("接口不存在", 404, "not_found")
 
     def do_GET(self):
@@ -480,6 +636,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._dispatch(method)
         except BusinessError as exc:
             self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except ScoreError as exc:
+            self._send(422, {"error": {"code": "invalid_score", "message": str(exc)}})
         except ValueError:
             self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc:

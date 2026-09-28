@@ -25,10 +25,19 @@ python -m unittest -v
 - `POST /api/papers/{id}/conflicts`：主席登记利益冲突。
 - `POST /api/papers/{id}/assignments`：主席邀请评审人，执行负载上限与冲突检查。
 - `POST /api/assignments/{id}/respond`：接受或拒绝邀请。
-- `POST /api/assignments/{id}/review`：提交 1-5 分评审。
+- `POST /api/assignments/{id}/review-draft`：暂存评审草稿，可多次续写，仅本人可见。
+- `GET /api/assignments/{id}/review`：评审人取回本人草稿/已提交评审（提交后只读）。
+- `POST /api/assignments/{id}/review`：提交三维度评审（创新性、严谨性、复现性，各 1-5 分），提交后原样锁定。
+- `GET /api/papers/{id}/reviews`：主席看每份评审的维度分与合成总分；作者在决定后只看三项平均分。
 - `POST /api/papers/{id}/rebuttal`：作者提交一次 Rebuttal。
 - `POST /api/papers/{id}/decision`：收到至少两份评审后作决定。
 - `GET /api/papers/{id}/history`：审计历史。
+
+## 评分模型
+
+评分计算集中在独立的 `scoring.py`（无数据库/HTTP 依赖）：三维度为创新性、严谨性、复现性，取值 1-5 整数，按 40% / 35% / 25% 合成总分。三项缺一不可提交；草稿允许只填部分。数据存取在 `app.py` 的 `ReviewStore`，页面在 `web/index.html`，三者分开维护。
+
+可见性：草稿只有评审人本人可见；提交后内容锁定不可再改。主席可看到每份已提交评审的维度分与总分；作者在论文决定后只能看到各维度的跨评审平均分。旧系统只有单一总分的评审（维度分为空）不参与维度平均，但其总分仍计入决定门槛，主席视图会标记为 `legacy`。
 
 ## 业务不变量
 
